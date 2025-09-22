@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: cantobot
+    env: docker
+    plan: free
+    autoDeploy: true
