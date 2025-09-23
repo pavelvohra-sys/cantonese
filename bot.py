@@ -1,29 +1,35 @@
-﻿import os, asyncio
-from aiohttp import web
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-import os, asyncio, html, tempfile, subprocess
+﻿import os, asyncio, html, tempfile, subprocess, sys, pathlib
 from dotenv import load_dotenv
+
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton, FSInputFile, BotCommand
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
-# Запоминаем позицию пользователя в каждом разделе
-USER_POS: dict[tuple[int, str], int] = {}
-
-def make_nav_kb(kind: str, idx: int, total: int) -> InlineKeyboardMarkup:
-    """kind: 'daily' | 'pensioners'"""
-    prev_i = (idx - 1) % total
-    next_i = (idx + 1) % total
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(text="⏮️ Пред.", callback_data=f"{kind}:nav:{prev_i}"),
-            InlineKeyboardButton(text="⏭️ След.", callback_data=f"{kind}:nav:{next_i}"),
-        ]]
-    )
+from aiogram.types import (
+    Message, BotCommand,
+    ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    FSInputFile
+)
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from rapidfuzz import fuzz
-# --- robust imports for mods (Render/GitHub/Docker) ---
-import sys, pathlib
+
+# ============ ENV ============
+load_dotenv()
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+PUBLIC_URL = os.getenv("PUBLIC_URL")  # https://<твой-сервис>.onrender.com
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "cantobot-secret")
+
+if not TOKEN:
+    raise SystemExit("ERROR: TELEGRAM_BOT_TOKEN is not set")
+if not PUBLIC_URL:
+    raise SystemExit("ERROR: PUBLIC_URL is not set")
+
+# ============ AIROGRAM CORE ============
+dp = Dispatcher()
+USER_POS: dict[tuple[int, str], int] = {}     # (user_id, section) -> index
+LAST_PROMPT: dict[int, str] = {}              # user_id -> last zh phrase
+
+# ============ ROBUST IMPORTS (mods/) ============
 BASE_DIR = pathlib.Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
@@ -31,46 +37,47 @@ MODS_DIR = BASE_DIR / "mods"
 if MODS_DIR.exists() and str(MODS_DIR) not in sys.path:
     sys.path.insert(0, str(MODS_DIR))
 try:
-    # обычный путь: пакет mods/*
-    from mods.tts_provider import tts_say
+    from mods.tts_provider import tts_say                   # (text, user_id?) -> mp3 path | None
     from mods.stt_provider import stt_recognize, wav_duration_sec
 except ModuleNotFoundError:
-    # запасной путь: файлы лежат рядом
+    # запасной путь, если модуль лежит рядом
     from tts_provider import tts_say
     from stt_provider import stt_recognize, wav_duration_sec
-# --- end robust imports ---
-# твои рабочие модули (из бэкапа)
-# === ENV ===
-load_dotenv()
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise SystemExit("ERROR: TELEGRAM_BOT_TOKEN is not set")
-dp = Dispatcher()  # ВАЖНО: объявлен ДО декораторов
-# === MENU (только 2 кнопки) ===
+
+# ============ MENU ============
 def main_menu():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="🎴 Daily"), KeyboardButton(text="🧓 Pensioners")]],
         resize_keyboard=True,
     )
-# === CONTENT (Daily + Pensioners) ===
+
+def make_nav_kb(kind: str, idx: int, total: int) -> InlineKeyboardMarkup:
+    prev_i = (idx - 1) % total
+    next_i = (idx + 1) % total
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="⏮️ пред", callback_data=f"{kind}:nav:{prev_i}"),
+        InlineKeyboardButton(text="⏭️ след", callback_data=f"{kind}:nav:{next_i}"),
+    ]])
+
+# ============ CONTENT ============
 PHRASES = [  # Daily
-    {"zh":"早晨！你食咗飯未呀？","yale":"zou2 san4! nei5 sik6 zo2 faan6 mei6 aa3?","ru":"Доброе утро! Ты уже ел(а)?"},
-    {"zh":"今晚有冇時間？","yale":"gam1 maan5 jau5 mou5 si4 gaan3 aa3?","ru":"Ты сегодня вечером свободен(на)?"},
-    {"zh":"呢啲點賣？","yale":"ni1 di1 dim2 maai6 aa3?","ru":"Сколько это стоит?"},
-    {"zh":"可唔可以平啲？","yale":"ho2 m4 ho2 ji5 peng4 di1 aa3?","ru":"Можно подешевле?"},
-    {"zh":"我用八達通得唔得？","yale":"ngo5 jung6 baat3 daat6 tung1 dak1 m4 dak1 aa3?","ru":"Можно оплатить Octopus-картой?"},
-    {"zh":"唔該幫我影張相。","yale":"m4 goi1 bong1 ngo5 jing2 zoeng1 soeng2.","ru":"Сфотографируй меня, пожалуйста."},
-    {"zh":"廁所喺邊度？","yale":"ci3 so2 hai2 bin1 dou6 aa3?","ru":"Где туалет?"},
+    {"zh":"早晨！你食咗飯未呀？","yale":"zou2 san4! nei5 sik6 zo2 faan6 mei6 aa3?","ru":"доброе утро! ты уже ел(а)?"},
+    {"zh":"今晚有冇時間？","yale":"gam1 maan5 jau5 mou5 si4 gaan3 aa3?","ru":"ты сегодня вечером свободен(на)?"},
+    {"zh":"呢啲點賣？","yale":"ni1 di1 dim2 maai6 aa3?","ru":"сколько это стоит?"},
+    {"zh":"可唔可以平啲？","yale":"ho2 m4 ho2 ji5 peng4 di1 aa3?","ru":"можно подешевле?"},
+    {"zh":"我用八達通得唔得？","yale":"ngo5 jung6 baat3 daat6 tung1 dak1 m4 dak1 aa3?","ru":"можно оплатить octopus-картой?"},
+    {"zh":"唔該幫我影張相。","yale":"m4 goi1 bong1 ngo5 jing2 zoeng1 soeng2.","ru":"сфотографируй меня, пожалуйста."},
+    {"zh":"廁所喺邊度？","yale":"ci3 so2 hai2 bin1 dou6 aa3?","ru":"где туалет?"},
 ]
-FUN_PENSIONERS = [  # "гонконгские пенсионеры"
-    {"zh":"你個假牙好型，我就鍾意呢款。","yale":"nei5 go3 gaa2 ngaa4 hou2 jing4, ngo5 zau6 zung1 ji3 ni1 fun2.","ru":"У тебя стильная вставная челюсть - как раз такие я и люблю."},
-    {"zh":"年紀差四十年，我都唔介意。","yale":"nin4 gei2 caa1 sei3 sap6 nin4, ngo5 dou1 m4 gaai3 ji3.","ru":"Разница в сорок лет меня вообще не смущает."},
-    {"zh":"我信一見轉數快嘅愛情。","yale":"ngo5 seon3 jat1 gin3 zyun3 sou3 faai3 ge3 oi3 cing4.","ru":"Я верю в любовь с первого банковского перевода (FPS)."},
-    {"zh":"我鍾意你對眼，唔係你喺中環嗰層千呎靚樓，老實講。","yale":"ngo5 zung1 ji3 nei5 deoi3 ngaan5, m4 hai6 nei5 hai2 zung1 waan4 go2 cang4 cin1 cek3 leng3 lau2, lou5 sat6 gong2.","ru":"Мне нравятся твои глаза, а не квартира в Центре, честно."},
-    {"zh":"我好鍾意你啲盆栽相，記得多啲傳畀我呀！","yale":"ngo5 hou2 zung1 ji3 nei5 di1 pun4 zoi1 soeng2, gei3 dak1 do1 di1 cyun4 bei2 ngo5 aa3!","ru":"Классные фото твоих растений - присылай ещё!"},
+FUN_PENSIONERS = [
+    {"zh":"你個假牙好型，我就鍾意呢款。","yale":"nei5 go3 gaa2 ngaa4 hou2 jing4, ngo5 zau6 zung1 ji3 ni1 fun2.","ru":"у тебя стильная вставная челюсть — как раз такие я и люблю."},
+    {"zh":"年紀差四十年，我都唔介意。","yale":"nin4 gei2 caa1 sei3 sap6 nin4, ngo5 dou1 m4 gaai3 ji3.","ru":"разница в сорок лет меня вообще не смущает."},
+    {"zh":"我信一見轉數快嘅愛情。","yale":"ngo5 seon3 jat1 gin3 zyun3 sou3 faai3 ge3 oi3 cing4.","ru":"я верю в любовь с первого банковского перевода (fps)."},
+    {"zh":"我鍾意你對眼，唔係你喺中環嗰層千呎靚樓，老實講。","yale":"ngo5 zung1 ji3 nei5 deoi3 ngaan5, m4 hai6 nei5 hai2 zung1 waan4 go2 cang4 cin1 cek3 leng3 lau2, lou5 sat6 gong2.","ru":"мне нравятся твои глаза, а не квартира в центре, честно."},
+    {"zh":"我好鍾意你啲盆栽相，記得多啲傳畀我呀！","yale":"ngo5 hou2 zung1 ji3 nei5 di1 pun4 zoi1 soeng2, gei3 dak1 do1 di1 cyun4 bei2 ngo5 aa3!","ru":"классные фото твоих растений — присылай ещё!"},
 ]
-# === HELPERS ===
-LAST_PROMPT: dict[int, str] = {}  # user_id -> last zh phrase
+
+# ============ HELPERS ============
 def card_text(title: str, p: dict) -> str:
     return (
         f"{title}\n\n"
@@ -78,13 +85,11 @@ def card_text(title: str, p: dict) -> str:
         f"🔤 {html.escape(p['yale'])}\n"
         f"🇷🇺 {html.escape(p['ru'])}"
     )
+
 def ogg_to_wav16k(src_path: str) -> str | None:
     fd, dst = tempfile.mkstemp(suffix=".wav"); os.close(fd)
     try:
-        p = subprocess.run(
-            ["ffmpeg","-y","-i",src_path,"-ar","16000","-ac","1",dst],
-            capture_output=True
-        )
+        p = subprocess.run(["ffmpeg","-y","-i",src_path,"-ar","16000","-ac","1",dst], capture_output=True)
         if p.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
             try: os.remove(dst)
             except: pass
@@ -94,8 +99,8 @@ def ogg_to_wav16k(src_path: str) -> str | None:
         try: os.remove(dst)
         except: pass
         return None
+
 async def send_card(m: Message, header: str, p: dict, kb: InlineKeyboardMarkup | None = None):
-    """Отправить карточку с TTS. Сохранить промпт для последующей проверки."""
     LAST_PROMPT[m.from_user.id] = p["zh"]
     txt = card_text(header, p)
     audio = await tts_say(p["zh"])
@@ -107,136 +112,126 @@ async def send_card(m: Message, header: str, p: dict, kb: InlineKeyboardMarkup |
             except: pass
     else:
         await m.answer(txt, parse_mode="HTML", reply_markup=kb)
-    await m.answer("🎤 Пришли голосовое, чтобы получить оценку (или набери /say).")
-# === HANDLERS ===
+    await m.answer("🎤 пришли голосовое, чтобы получить оценку (или набери /say).")
+
+# ============ HANDLERS ============
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
-    await m.answer("👋 Бот готов. Выбирай режим ниже.", reply_markup=main_menu())
+    await m.answer("👋 бот готов. выбирай режим ниже.", reply_markup=main_menu())
+
 @dp.message(F.text == "🎴 Daily")
 @dp.message(Command("daily"))
 async def cmd_daily(m: Message):
     i = USER_POS.get((m.from_user.id, "daily"), 0)
     i = max(0, min(i, len(PHRASES) - 1))
     kb = make_nav_kb("daily", i, len(PHRASES))
-    await send_card(m, "🎴 Daily", PHRASES[i], kb)
+    await send_card(m, "🎴 daily", PHRASES[i], kb)
+
 @dp.message(F.text == "🧓 Pensioners")
 @dp.message(Command("pensioners"))
 async def cmd_pensioners(m: Message):
     i = USER_POS.get((m.from_user.id, "pensioners"), 0)
     i = max(0, min(i, len(FUN_PENSIONERS) - 1))
     kb = make_nav_kb("pensioners", i, len(FUN_PENSIONERS))
-    await send_card(m, "🧓 Pensioners", FUN_PENSIONERS[i], kb)
+    await send_card(m, "🧓 pensioners", FUN_PENSIONERS[i], kb)
+
 @dp.callback_query(F.data.startswith("daily:nav:"))
 async def cb_daily_nav(cb):
     try:
         _, _, idx = cb.data.split(":")
         i = int(idx)
     except Exception:
-        await cb.answer()
-        return
+        await cb.answer(); return
     USER_POS[(cb.from_user.id, "daily")] = i
     kb = make_nav_kb("daily", i, len(PHRASES))
-    # Отправляем НОВУЮ карточку (редактировать аудио неудобно)
-    await send_card(cb.message, "🎴 Daily", PHRASES[i], kb)
+    await send_card(cb.message, "🎴 daily", PHRASES[i], kb)
     await cb.answer()
+
 @dp.callback_query(F.data.startswith("pensioners:nav:"))
 async def cb_pensioners_nav(cb):
     try:
         _, _, idx = cb.data.split(":")
         i = int(idx)
     except Exception:
-        await cb.answer()
-        return
+        await cb.answer(); return
     USER_POS[(cb.from_user.id, "pensioners")] = i
     kb = make_nav_kb("pensioners", i, len(FUN_PENSIONERS))
-    await send_card(cb.message, "🧓 Pensioners", FUN_PENSIONERS[i], kb)
+    await send_card(cb.message, "🧓 pensioners", FUN_PENSIONERS[i], kb)
     await cb.answer()
+
 @dp.message(Command("say"))
 async def cmd_say(m: Message):
     ref = LAST_PROMPT.get(m.from_user.id) or PHRASES[0]["zh"]
     LAST_PROMPT[m.from_user.id] = ref
     await m.answer(
-        "🎙️ Скажи фразу и отправь <b>голосовое сообщение</b>.\n"
-        "Эталон:\n"
+        "🎙️ скажи фразу и отправь <b>голосовое сообщение</b>.\n"
+        "эталон:\n"
         f"<b>{html.escape(ref)}</b>",
         parse_mode="HTML"
     )
+
 @dp.message(F.voice | F.audio)
 async def on_voice(m: Message, bot: Bot):
-    # 1) скачать файл
     tgfile = await bot.get_file((m.voice or m.audio).file_id)
     fd_src, path_src = tempfile.mkstemp(suffix=".ogg"); os.close(fd_src)
     await bot.download(tgfile, destination=path_src)
-    # 2) конверт в wav16k
+
     wav = ogg_to_wav16k(path_src)
-    try:
-        os.remove(path_src)
-    except Exception:
-        pass
+    try: os.remove(path_src)
+    except: pass
     if not wav:
-        await m.answer("⚠️ Не удалось обработать аудио (ffmpeg).")
-        return
-    # 3) контроль длины, распознавание
+        await m.answer("⚠️ не удалось обработать аудио (ffmpeg)."); return
+
     dur = wav_duration_sec(wav)
     if dur < 0.6:
-        await m.answer("🔈 Запись слишком короткая (<0.6 с). Скажи 1-3 секунды и пришли ещё раз.")
+        await m.answer("🔈 запись слишком короткая (<0.6 с). скажи 1–3 секунды и пришли ещё раз.")
         try: os.remove(wav)
         except: pass
         return
+
     text = await stt_recognize(wav, m.from_user.id)
     try: os.remove(wav)
     except: pass
     if not text:
-        await m.answer("🤷 Не удалось распознать речь. Попробуй ближе к микрофону, без шума.")
-        return
-    # 4) сравнение с эталоном
+        await m.answer("🤷 не удалось распознать речь. попробуй ближе к микрофону, без шума."); return
+
     ref = LAST_PROMPT.get(m.from_user.id) or PHRASES[0]["zh"]
     score = int(fuzz.ratio(text, ref))
     body = (
-        "🧪 <b>Проверка произношения</b>\n"
-        f"🗣️ Ты сказал: <code>{html.escape(text)}</code>\n"
-        f"🎯 Эталон: <b>{html.escape(ref)}</b>\n"
-        f"📊 Совпадение: <b>{score}%</b>"
+        "🧪 <b>проверка произношения</b>\n"
+        f"🗣️ ты сказал: <code>{html.escape(text)}</code>\n"
+        f"🎯 эталон: <b>{html.escape(ref)}</b>\n"
+        f"📊 совпадение: <b>{score}%</b>"
     )
     await m.answer(body, parse_mode="HTML")
-# === MAIN ===
+
+# ============ WEBHOOK MAIN ============
 async def main():
     bot = Bot(TOKEN)
+
+    # чистим возможный старый вебхук
     await bot.delete_webhook(drop_pending_updates=True)
+
+    # команды
     await bot.set_my_commands([
-        BotCommand(command="daily",       description="Daily phrases"),
-        BotCommand(command="pensioners",  description="Funny seniors"),
-        BotCommand(command="say",         description="Speak & get score"),
+        BotCommand(command="daily",      description="daily phrases"),
+        BotCommand(command="pensioners", description="funny seniors"),
+        BotCommand(command="say",        description="speak & get score"),
     ])
-    print("[INFO] Bot started.")
-   async def main():
-    bot = Bot(os.getenv("TELEGRAM_BOT_TOKEN"))
-    dp = Dispatcher()
-    # ... твои router/handlers регистрации ...
 
-    public_url = os.getenv("PUBLIC_URL")  # напр.: https://<твоёимя>.onrender.com
-    secret = os.getenv("WEBHOOK_SECRET", "cantobot-secret")
-
-    if not public_url:
-        raise RuntimeError("PUBLIC_URL is not set")
-
-    # выключаем возможный старый хук и чистим апдейты
-    await bot.delete_webhook(drop_pending_updates=True)
-
-    # включаем webhook на свой URL
+    # регистрируем webhook на свой URL
     await bot.set_webhook(
-        url=f"{public_url}/tg/{secret}",
-        secret_token=secret,
+        url=f"{PUBLIC_URL}/tg/{WEBHOOK_SECRET}",
+        secret_token=WEBHOOK_SECRET,
         drop_pending_updates=True
     )
 
-    # поднимаем aiohttp-приложение
+    # aiohttp-приложение
     app = web.Application()
-    SimpleRequestHandler(dp, bot, secret_token=secret).register(app, path=f"/tg/{secret}")
+    SimpleRequestHandler(dp, bot, secret_token=WEBHOOK_SECRET).register(app, path=f"/tg/{WEBHOOK_SECRET}")
 
-    # health-роуты, чтобы Render видел живой сервис
     async def _health(request): return web.Response(text="ok")
-    app.add_routes([web.get("/"), web.get("/health")], name="health")
+    app.add_routes([web.get("/"), web.get("/health")])
     setup_application(app, dp, bot=bot)
 
     port = int(os.getenv("PORT", "10000"))
@@ -245,31 +240,12 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
-    print(f"[INFO] webhook set → {public_url}/tg/{secret}")
+    print(f"[INFO] webhook set → {PUBLIC_URL}/tg/{WEBHOOK_SECRET}")
     print(f"[INFO] http listen on 0.0.0.0:{port}")
 
     # держим процесс
     while True:
         await asyncio.sleep(3600)
 
-
-    # локально не запускаем, чтобы не ловить Conflict
-    if os.getenv("RUN_BOT", "1") != "1":
-        print("[INFO] RUN_BOT!=1 — idle mode")
-        asyncio.get_event_loop().run_forever()
-
-    backoff = 1
-    while True:
-        try:
-            asyncio.run(main())   # твой main() с delete_webhook и т.д.
-            break                 # корректно вышли — не перезапускаем
-        except Exception as e:
-            print("[FATAL] main crashed:", e)
-            traceback.print_exc()
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-            if __name__ == "__main__":
+if __name__ == "__main__":
     asyncio.run(main())
-
-
-
