@@ -209,5 +209,23 @@ async def main():
     await dp.start_polling(bot)
 if __name__ == "__main__":
     asyncio.run(main())
+if __name__ == "__main__":
+    import os, asyncio, time, traceback
+
+    # локально не запускаем, чтобы не ловить Conflict
+    if os.getenv("RUN_BOT", "1") != "1":
+        print("[INFO] RUN_BOT!=1 — idle mode")
+        asyncio.get_event_loop().run_forever()
+
+    backoff = 1
+    while True:
+        try:
+            asyncio.run(main())   # твой main() с delete_webhook и т.д.
+            break                 # корректно вышли — не перезапускаем
+        except Exception as e:
+            print("[FATAL] main crashed:", e)
+            traceback.print_exc()
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
 
 
