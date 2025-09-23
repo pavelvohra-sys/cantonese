@@ -231,7 +231,7 @@ async def main():
     SimpleRequestHandler(dp, bot, secret_token=WEBHOOK_SECRET).register(app, path=f"/tg/{WEBHOOK_SECRET}")
 
     async def _health(request): return web.Response(text="ok")
-    app.add_routes([web.get("/"), web.get("/health")])
+    app.add_routes([web.get("/", _health), web.get("/health", _health)])
     setup_application(app, dp, bot=bot)
 
     port = int(os.getenv("PORT", "10000"))
