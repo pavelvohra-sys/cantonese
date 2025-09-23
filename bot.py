@@ -19,9 +19,24 @@ def make_nav_kb(kind: str, idx: int, total: int) -> InlineKeyboardMarkup:
         ]]
     )
 from rapidfuzz import fuzz
+# --- robust imports for mods (Render/GitHub/Docker) ---
+import sys, pathlib
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+MODS_DIR = BASE_DIR / "mods"
+if MODS_DIR.exists() and str(MODS_DIR) not in sys.path:
+    sys.path.insert(0, str(MODS_DIR))
+try:
+    # обычный путь: пакет mods/*
+    from mods.tts_provider import tts_say
+    from mods.stt_provider import stt_recognize, wav_duration_sec
+except ModuleNotFoundError:
+    # запасной путь: файлы лежат рядом
+    from tts_provider import tts_say
+    from stt_provider import stt_recognize, wav_duration_sec
+# --- end robust imports ---
 # твои рабочие модули (из бэкапа)
-from mods.tts_provider import tts_say               # (text, user_id) -> path/to/mp3 | None
-from mods.stt_provider import stt_recognize, wav_duration_sec  # (wav_path, user_id) -> text|None; (wav)->seconds
 # === ENV ===
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -194,4 +209,5 @@ async def main():
     await dp.start_polling(bot)
 if __name__ == "__main__":
     asyncio.run(main())
+
 
