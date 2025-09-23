@@ -1,4 +1,7 @@
-﻿import os, asyncio, html, tempfile, subprocess
+﻿import os, asyncio
+from aiohttp import web
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+import os, asyncio, html, tempfile, subprocess
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -206,11 +209,49 @@ async def main():
         BotCommand(command="say",         description="Speak & get score"),
     ])
     print("[INFO] Bot started.")
-    await dp.start_polling(bot)
-if __name__ == "__main__":
-    asyncio.run(main())
-if __name__ == "__main__":
-    import os, asyncio, time, traceback
+   async def main():
+    bot = Bot(os.getenv("TELEGRAM_BOT_TOKEN"))
+    dp = Dispatcher()
+    # ... твои router/handlers регистрации ...
+
+    public_url = os.getenv("PUBLIC_URL")  # напр.: https://<твоёимя>.onrender.com
+    secret = os.getenv("WEBHOOK_SECRET", "cantobot-secret")
+
+    if not public_url:
+        raise RuntimeError("PUBLIC_URL is not set")
+
+    # выключаем возможный старый хук и чистим апдейты
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    # включаем webhook на свой URL
+    await bot.set_webhook(
+        url=f"{public_url}/tg/{secret}",
+        secret_token=secret,
+        drop_pending_updates=True
+    )
+
+    # поднимаем aiohttp-приложение
+    app = web.Application()
+    SimpleRequestHandler(dp, bot, secret_token=secret).register(app, path=f"/tg/{secret}")
+
+    # health-роуты, чтобы Render видел живой сервис
+    async def _health(request): return web.Response(text="ok")
+    app.add_routes([web.get("/"), web.get("/health")], name="health")
+    setup_application(app, dp, bot=bot)
+
+    port = int(os.getenv("PORT", "10000"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    print(f"[INFO] webhook set → {public_url}/tg/{secret}")
+    print(f"[INFO] http listen on 0.0.0.0:{port}")
+
+    # держим процесс
+    while True:
+        await asyncio.sleep(3600)
+
 
     # локально не запускаем, чтобы не ловить Conflict
     if os.getenv("RUN_BOT", "1") != "1":
@@ -227,5 +268,8 @@ if __name__ == "__main__":
             traceback.print_exc()
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
+            if __name__ == "__main__":
+    asyncio.run(main())
+
 
 
