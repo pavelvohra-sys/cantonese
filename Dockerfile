@@ -1,7 +1,6 @@
 # ===== Base =====
 FROM python:3.11-slim
 
-# Ускорители/чистота логов
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -13,16 +12,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 
 # ===== App =====
 WORKDIR /app
-# Чтобы python импортировал пакеты из корня (mods/ и т.д.)
 ENV PYTHONPATH=/app
 
-# Сначала зависимости (чтобы кешировалось)
 COPY requirements.txt .
 RUN python -m pip install -r requirements.txt
 
-# Потом весь проект (включая mods/, bot.py, etc.)
 COPY . .
 
-# ===== Run (Render Web Service, free) =====
-# Render требует, чтобы кто-то слушал $PORT. Поднимем http-сервер + параллельно бота.
-CMD sh -c "python -m http.server \$PORT & python bot.py"
+# ===== Run =====
+CMD ["python", "bot.py"]
